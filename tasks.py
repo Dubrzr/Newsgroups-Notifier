@@ -1,10 +1,12 @@
+import nntplib
+import hashlib
 from celery import Celery
+from settings import hosts, users, mail,\
+    SECONDS_DELTA, BOT_TAG, BOT_MSG, SEND_FROM_POSTER, PUSH, MAIL
 from datetime import timedelta
 from datetime import datetime
-import nntplib
-import smtplib
-import hashlib
-from email.mime.text import MIMEText
+from notifs import Notif
+
 
 def parse_nntp_date(str):
     # Parsing the date of the post
@@ -54,136 +56,161 @@ def hash_plz(over):
 
     return hashlib.sha1(str).hexdigest()
 
-app_end_msg = "\nThis message has been sent automatically by the *BOT*."
 
-time_delta = timedelta(seconds=60)
-nb_last = 50
-
-hosts = [
-    {
-        'host': 'news.epita.fr',
-        'port': 119,
-        'user': None,
-        'pass': None,
-        'ssl' : False,
-        #'groups': ['iit.test'],
-        'groups': ['epita.assistants', 'epita.cours.c-unix.42sh', 'epita.adm.a1', 'iit.adm', 'epita.adm.adm', 'epita.delegues', 'iit.assos.gconfs', 'epita.cours.c++.atelier',
-		   'epita.cours.c++']
-    }
-]
-
-mail = {
-    'fromaddr': 'your_send@email.com',
-    'toaddrs': ['your@email.com'],
-    'host': 'host.com',
-    'port':  465,
-    'user': 'your@email.com',
-    'pass': 'your_password',
-    'ssl': True
-}
-
-class Notifier():
-    def __init__(self, hosts):
-        self.host = hosts[0]['host']
-        self.port = hosts[0]['port']
-        self.ssl = hosts[0]['ssl']
-        self.user = hosts[0]['user']
-        self.password = hosts[0]['pass']
-        self.groups = hosts[0]['groups']
-        self.last_update = datetime.utcnow() # Use UTC+0000
+class NewsGetter:
+    def __init__(self, hosts, users):
+        self.hosts = hosts
+        self.users = users
+        self.notif_obj = Notif()
         self.known_ids = None
 
-    def send_email(self, group, header, msg):
-
-        msg = MIMEText(msg + app_end_msg)# msg_bottom)
-        msg['Subject'] = header['subject'] + ' [BOT]'
-        msg['From'] = header['from']# mail['fromaddr']
-        msg['To'] = ", ".join(mail['toaddrs'])
-#        print(header)
+    def connect_to_host(self, ssl, host, port, user, password, tout):
         try:
-            if mail['ssl']:
-                server = smtplib.SMTP_SSL(mail['host'],mail['port'], timeout=10)
+            if ssl:
+                co = nntplib.NNTP_SSL(host, port, user, password, timeout=tout)
             else:
-                server = smtplib.SMTP(mail['host'], mail['port'], timeout=10)
+                co = nntplib.NNTP(host, port, user, password, timeout=tout)
         except Exception as err:
-            print('Can\'t connect to the email server.')
+            print("Can't connect to the host {}.".format(host))
             print("Error: {}".format(err))
-            return False
+            return None
+        return co
 
+    def get_overviews(self, co, group_name):
         try:
-            server.login(mail['user'], mail['pass'])
-            server.send_message(msg)
-            server.quit()
+            # Getting infos & data from the given group
+            _, _, first, last, _ = co.group(group_name)
+            # Sending a OVER command to get last_nb posts
+            _, overviews = co.over((first, last))
         except Exception as err:
-            print("Can't send email...")
+            print("Can't get news from {} group.".format(group_name))
             print("Error: {}".format(err))
-            return False
-        return True
+            return None
+        return overviews
+
+    def send_notifs(self, name, group, header, msg):
+        m = 0
+        p = 0
+
+        m_msg = msg + ' ' + BOT_MSG
+        m_subject = header['subject'] + ' ' + BOT_TAG
+        m_from_addr = header['from'] if SEND_FROM_POSTER else mail['address']
+        m_to_addrs = ''
+
+        # Mails
+        for _, user in self.users.items():
+            #print(user)
+            if not MAIL or not user['notifs']['mail']:
+                pass
+            for host_name in user['subscriptions']:
+                if host_name == name:
+                    m_to_addrs += ', ' if m_to_addrs != '' else ''
+                    m_to_addrs += user['mail']
+                    m += 1
+
+        # Send email in one time
+        if self.notif_obj.send_email(m_msg, m_subject, m_from_addr, m_to_addrs):
+            pass
+        else:
+            m = 0
 
 
-    def get_last(self, time_delta):
-        try:
-            # Connecting to the server...
-            if self.ssl:
-                co = nntplib.NNTP_SSL(self.host, self.port, self.user,
-                                   self.password, timeout=10)
-            else:
-                co = nntplib.NNTP(self.host, self.port, self.user,
-                                  self.password, timeout=10)
-        except Exception as err:
-            print("Can't connect to the host {}.".format(self.host))
-            print("Error: {}".format(err))
+        for _, user in self.users.items():
+            if not PUSH or not user['notifs']['push']:
+                pass
+            self.notif_obj.send_pushbullet(user['pushbullet_api_key'], None,
+                                           m_subject, m_msg)
+
+        return (m, p)
+
+    def add_host(self, name, host):
+        co = self.connect_to_host(
+            host['ssl'],
+            host['host'],
+            host['port'],
+            host['user'],
+            host['pass'],
+            host['timeout']
+        )
+        if not co:
             return 0
-
-        i = 0
         if self.known_ids is None:
             self.known_ids = []
-            for group in self.groups:
-                print("Adding '{}' group...".format(group))
-                _, _, first, last, _ = co.group(group)
-                _, overviews = co.over((first, last))
-                for id, over in overviews:
-                    self.known_ids.append(hash_plz(over))
-        else:
-            for group in self.groups:
-                print("Checking '{}' group...".format(group))
+        for group in host['groups']:
+            print("Adding '{}' group...".format(group))
 
-                # Getting infos & data from the given group
-                _, _, first, last, _ = co.group(group)
+            overviews = self.get_overviews(co, group)
+            if not overviews:
+                pass
 
-                # Sending a OVER command to get last_nb posts
-                resp, overviews = co.over((first, last))
+            for id, over in overviews:
+                self.known_ids.append(hash_plz(over))
 
-                # For each post in all post...
+    def check_host(self, name, host):
+        co = self.connect_to_host(
+            host['ssl'],
+            host['host'],
+            host['port'],
+            host['user'],
+            host['pass'],
+            host['timeout']
+        )
+        if not co:
+            return 0
 
-                for id, over in overviews:
-                    over_hash = hash_plz(over)
-                    if over_hash is None:
-                        continue
+        m = 0
+        p = 0
+        for group in host['groups']:
+            print("Checking '{}' group...".format(group))
 
-                    # If the post is not new we continue to the next post...
-                    if over_hash in self.known_ids:
-                        continue
-                    self.known_ids.append(over_hash)
+            overviews = self.get_overviews(co, group)
+            if not overviews:
+                pass
 
-                    # Parsing the date of the post
-                    post_date = parse_nntp_date(over['date'])
-                    if post_date is None:
-                        self.known_ids.remove(over_hash)
-                        continue
-                    print("Post Date = {}".format(post_date))
+            # For each post in all post...
+            for id, over in overviews:
+                over_hash = hash_plz(over)
+                if over_hash is None:
+                    continue
 
-                    _, info = co.body(over['message-id'])
-                    result = ''
-                    for line in info[2]:
-                        result += get_decoded(line) + '\n'
-                    print(result)
-                    if (self.send_email(group, over, result)):
-                        self.last_update = datetime.utcnow()
-                        i += 1
+                # If the post is not new we continue to the next post...
+                if over_hash in self.known_ids:
+                    continue
+
+                self.known_ids.append(over_hash)
+
+                # Parsing the date of the post
+                post_date = parse_nntp_date(over['date'])
+                if post_date is None:
+                    self.known_ids.remove(over_hash)
+                    continue
+                print("==> Found a new message! {}".format(post_date))
+
+                _, info = co.body(over['message-id'])
+                result = ''
+                for line in info[2]:
+                    result += get_decoded(line) + '\n'
+
+                tmp_m, tmp_p = self.send_notifs(name, group, over, result)
+                m += tmp_m
+                p += tmp_p
         co.quit()
-        return i
+        return (m, p)
 
+    def check_all(self):
+        m = 0
+        p = 0
+        if not self.known_ids:
+            for name, host in self.hosts.items():
+                print('Adding [{}] host.'.format(name.upper()))
+                self.add_host(name, host)
+        else:
+            for name, host in self.hosts.items():
+                print('Checking [{}] host.'.format(name.upper()))
+                tmp_m, tmp_p = self.check_host(name, host)
+                m += tmp_m
+                p += tmp_p
+        return (m, p)
 
 
 celery = Celery('tasks')
@@ -207,14 +234,17 @@ celery.conf.update(
     CELERYBEAT_SCHEDULE = {
         'every-minute': {
             'task': 'tasks.update',
-            'schedule': time_delta,
+            'schedule': timedelta(seconds=SECONDS_DELTA),
         },
     }
 )
 
 
-news_updater = Notifier(hosts)
+# Launching the app
+
+news_updater = NewsGetter(hosts, users)
 
 @celery.task
 def update():
-    print("Sent {} email updates.".format(news_updater.get_last(time_delta)))
+    nb_m, nb_p =  news_updater.check_all()
+    print("Sent {} email updates.\nSent {} push updates.".format(nb_m, nb_p))
