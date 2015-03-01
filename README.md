@@ -4,6 +4,8 @@ DESCRIPTION
 A tiny script to receive push notifications (using Pushbullet), and/or emails
 when a news is posted on multiple predefined groups and multiple hosts.
 
+NOTE: A new version of the notifier is available, but as a webapp [here](https://github.com/Dubrzr/NG-Notifier).
+
 REQUIREMENTS
 ============
 
